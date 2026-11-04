@@ -3,30 +3,55 @@
 namespace App\Console\Commands;
 
 use App\Models\Book;
+use App\Support\CategoryMapper;
 use Illuminate\Console\Command;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 
 class ImportGutenbergBooks extends Command
 {
-    protected $signature = 'books:import {--count=220 : Total books to have in the catalog}';
+    protected $signature = 'books:import
+        {--count=220 : Total books to have in the catalog}
+        {--start-page=1 : Gutendex page to start from (use this to resume after a failure)}
+        {--max-failures=5 : Stop after this many pages in a row fail}';
 
     protected $description = 'Import public-domain books (metadata + EPUB links) from Project Gutenberg via Gutendex';
+
+    private const BASE_URL = 'https://gutendex.com/books/';
 
     public function handle(): int
     {
         $target = (int) $this->option('count');
-        $url = 'https://gutendex.com/books?languages=en&mime_type=application%2Fepub';
+        $page = max(1, (int) $this->option('start-page'));
+        $maxFailures = max(1, (int) $this->option('max-failures'));
 
-        $this->info("Importing until the catalog has {$target} books...");
+        $failuresInARow = 0;
+        $skipped = [];
 
-        while ($url && Book::count() < $target) {
-            $response = Http::timeout(30)->retry(3, 1500)->get($url);
+        $this->info("Importing until the catalog has {$target} books (starting at page {$page})...");
 
-            if ($response->failed()) {
-                $this->error("Gutendex request failed: HTTP {$response->status()}");
-                return self::FAILURE;
+        while (Book::count() < $target) {
+            $response = $this->fetchPage($page);
+
+            if ($response === null) {
+                $failuresInARow++;
+                $skipped[] = $page;
+                $this->warn("  page {$page} failed after retries");
+
+                if ($failuresInARow >= $maxFailures) {
+                    $this->error("Stopped after {$failuresInARow} failed pages in a row. Gutendex looks unavailable.");
+                    $this->line("Resume later with: php artisan books:import --count={$target} --start-page={$page}");
+
+                    return self::FAILURE;
+                }
+
+                $page++;
+                continue;
             }
+
+            $failuresInARow = 0;
 
             foreach ($response->json('results', []) as $item) {
                 if (Book::count() >= $target) {
@@ -55,13 +80,47 @@ class ImportGutenbergBooks extends Command
                 );
             }
 
-            $this->line('  catalog size: ' . Book::count());
-            $url = $response->json('next');
+            $this->line("  page {$page} done, catalog size: " . Book::count());
+
+            if (! $response->json('next')) {
+                $this->warn('Reached the last page Gutendex offers.');
+                break;
+            }
+
+            $page++;
         }
 
         $this->info('Done. Total books: ' . Book::count());
 
+        if ($skipped) {
+            $this->warn('Skipped pages: ' . implode(', ', $skipped) . '. Re-run with --start-page=<page> to fill them in.');
+        }
+
+        if (Book::count() < $target) {
+            $this->warn("Catalog is below the target of {$target}. Run the command again later to continue.");
+        }
+
         return self::SUCCESS;
+    }
+
+    /**
+     * Fetch one Gutendex page. Returns null if it still fails after retries,
+     * so a single bad page never crashes the whole import.
+     */
+    private function fetchPage(int $page): ?Response
+    {
+        try {
+            $response = Http::timeout(30)
+                ->retry(3, 2000, throw: false)
+                ->get(self::BASE_URL, [
+                    'languages' => 'en',
+                    'page'      => $page,
+                ]);
+        } catch (ConnectionException $e) {
+            return null;
+        }
+
+        return $response->successful() ? $response : null;
     }
 
     private function authorName(array $item): string
@@ -79,17 +138,16 @@ class ImportGutenbergBooks extends Command
 
     private function category(array $item): string
     {
-        $shelf = $item['bookshelves'][0] ?? null;
-        if ($shelf) {
-            return Str::limit(trim(preg_replace('/^Category:\s*/i', '', $shelf)), 110, '');
-        }
+        // Look at every bookshelf and subject, then collapse them into one broad category.
+        $labels = array_merge(
+            array_map(fn ($shelf) => preg_replace('/^Category:\s*/i', '', $shelf), $item['bookshelves'] ?? []),
+            array_map(fn ($subject) => explode(' -- ', $subject)[0], $item['subjects'] ?? [])
+        );
 
-        $subject = $item['subjects'][0] ?? null;
-        if ($subject) {
-            return Str::limit(trim(explode(' -- ', $subject)[0]), 110, '');
-        }
-
-        return 'General';
+        return CategoryMapper::map(
+            implode(' | ', $labels),
+            ($item['title'] ?? '') . ' ' . $this->description($item)
+        );
     }
 
     private function description(array $item): string
